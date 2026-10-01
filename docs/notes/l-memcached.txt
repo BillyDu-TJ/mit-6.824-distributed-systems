@@ -1,0 +1,291 @@
+6.5840 2026 Lecture 16: Scaling Memcache at Facebook
+
+Scaling Memcache at Facebook, by Nishtala et al, NSDI 2013
+
+why are we reading this paper?
+  it's an experience paper
+  how did the authors scale up a big system?
+  problems? solutions?
+  a window into the real world
+  performance vs consistency vs practicality
+
+the big facebook infrastructure picture
+  lots of data: friend lists, status, posts, likes, photos
+  fresh/consistent data not critical -- humans are tolerant
+  read-heavy (helpful)
+  little locality (not helpful)
+  high load: billions of storage operations per second
+    much higher than a single storage server can handle
+      ~100,000 simple queries/s for mysql
+      ~1,000,000 get/puts/s  for memcached
+  multiple data centers (at least west and east coast)
+  [diagram]
+  each data center -- "region":
+    "real" data sharded over MySQL DBs -- ACID, but slow
+    memcached layer (mc) -- in RAM: fast but limited size
+    web servers (clients of memcached and DB) -- "stateless"
+  each data center's DBs contain full replica
+  west coast is primary, others are replicas via MySQL async log replication
+
+let's talk about performance first
+  much of paper is about avoiding stale cached data
+  but staleness arose from efforts to increase performance
+
+what is memcached?
+  a simple key/value server: put(k,v), get(k), delete(k).
+  in RAM: fast, not durable, no replication.
+  LRU eviction, since RAM size limited
+  stores what clients tell it to.
+  usually lots of memcached servers are deployed.
+    clients decide what to store where.
+
+how do FB apps use mc? Figure 1.
+  FB uses mc as a "look-aside" cache
+    real data is in the DB
+    application talks separately to mc and (if miss or write) to DB
+    mc doesn't know about the DB
+  read(k):
+    h = hash(k) % n  -- hash chooses which memcache server to talk to
+    v = mc[h].get(k)
+    if v is nil:
+      v = fetch from DB
+      put(k, v)
+  write(k,v):
+    send k,v to DB
+    h = hash(k) % n
+    mc[h].delete(k)
+
+memcached very popular!
+  look-aside makes it easy to add to existing web applications
+  cache anything from DB rows to entire computed html pages
+  flexible, simple, fast
+
+what is the benefit of using mc?
+  it's only helpful for reads -- but that's by far the majority of operations
+  high hit rate -> reduces load on DB servers
+    Table 2 says about 99% hit rate, i.e. 100x reduction in DB read load
+    wow; but watch out: a 1% decrease in hit rate *doubles* DB load
+  this caching is not about reducing user-visible delay,
+    it's about protecting the DB servers from massive overload.
+
+lots of mc servers are needed to handle the total load
+  CPU/network parallelism
+  total RAM
+  how to divide the load among the memcache servers?
+
+the client hash function determines how keys are assigned to mc servers
+  can shard (partition), or replicate, or some combination
+  all web servers use the same hash(k) function
+    so if C1 caches key k, C2 will see it!
+  central configuration manager tells clients how to hash
+
+will sharding or replication yield most mc throughput?
+  this is a central concern in many designs
+  [two little diagrams]
+  sharding: divide keys over mc servers
+  replicate: divide clients over mc servers
+  sharding:
+    + memory-efficient (only one copy of each k/v pair)
+    - not effective if a few keys are extremely popular
+    - each web server must talk to many mc servers (high packet overhead)
+    - risk of "in-cast congestion"
+  replication:
+    + useful if a few keys are very popular for reads
+    + can pack many requests/responses per packet (low overhead)
+    + few servers need be contacted, reducing per-packet costs
+    + easier to design supporting network (2 x-capacity nets easier than 1 2x)
+    - uses more memory, so fewer distinct items can be cached
+    - writes are more expensive
+
+performance and multiple regions (Section 5)
+
+[diagram: west, db primary shards, mc servers, clients |
+ east, db secondary shards, ...,
+ feed from db primaries to secondaries ]
+
+Q: what is the point of regions -- multiple complete replicas?
+   lower RTT to users (east coast, west coast)
+   quick local reads, from local mc and DB
+   (though writes are expensive: must be sent to primary region)
+   hot replica in case primary site fails
+
+Q: why not divide users over regions?
+   i.e. why not east-coast users' data in east-coast region, &c
+   then no need to replicate: might cut hardware costs in half!
+   but: social net -> not much locality
+   might work well for e.g. e-mail
+
+Q: why OK performance despite writes sent to the primary region?
+   writes are much rarer than reads
+   users do not wait for writes to finish
+   
+performance within a region (Section 4)
+
+[diagram: db shards, multiple clusters, each w/ mc's and clients ]
+
+multiple mc clusters *within* each region
+  cluster = complete set of mc cache servers + web servers
+  each web server hashes keys over just the mc servers in its cluster
+
+why multiple clusters per region?
+  why not a single big cluster in each region?
+    divide the load among many parallel mc servers?
+  1. more mc servers don't help very popular keys
+     replicating (one copy per cluster) does help
+  2. more mcs in cluster -> sharded more finely ->
+       each web view sends more packets (to more mc servers)
+     and more in-cast congestion from replies
+     client requests fetch 20 to 500 keys! over many mc servers
+     MUST request in parallel (total latency too large if serial)
+     but then all replies come back at the same time
+     network switches, NIC run out of buffers
+  3. hard to build network for single big cluster
+     any-to-any client/server access
+     so cross-section b/w must be large -- expensive
+     two clusters -> 1/2 the cross-section b/w
+
+but -- replicating is a waste of RAM for less-popular items
+  "regional pool" shared by all clusters
+  unpopular objects (no need for many copies)
+  the application s/w decides what keys to put in regional pool
+  frees mc servers to replicate more popular objects
+
+bringing up new mc cluster is a performance problem
+  new cluster has 0% hit rate
+  so its clients could generate big spike in DB load
+  thus the clients of new cluster first get() from existing cluster (4.3)
+    and put() into new cluster
+    basically lazy copy of existing cluster to new cluster
+
+another overload problem: thundering herd
+  one client updates DB and delete()s a key
+  lots of clients get() but miss
+    they all fetch the same data from DB
+  not good: needless DB load
+  solution: mc gives just the first missing client a "lease"
+    lease = permission to refresh from DB
+    mc remembers set of valid leases
+    mc tells others "try get() again in a few milliseconds"
+  effect: only one client reads the DB and does put()
+    others re-try get() later and hopefully hit
+    
+what if an mc server fails (Section 3.3)?
+  can't have DB servers handle the misses -- too much load
+  can't shift load to another mc server -- too much load
+  Gutter -- pool of idle mc servers, clients only use after mc server fails
+    separate Gutter per cluster
+  after a while, failed mc server will be replaced
+  as long as only a few mc servers are down at any one time,
+    a small Gutter pool can act as backups for a large set of mc servers
+
+The Question:
+  why aren't invalidates (deletes) sent to Gutter servers?
+    from web servers and MySQL/McSqueal
+  my guess:
+    Gutter can hold *any* key
+    so all invalidates would have to be sent to Gutter 
+    this at least doubles delete traffic
+    and may place a heavy load on small # of Gutter servers
+
+let's talk about consistency now
+
+what is the paper's consistency plan?
+  writes go direct to primary DB, with transactions, so DB stays consistent
+    e.g. incrementing a "like" count will be correct
+  what about reads?
+    reads not guaranteed to see the latest write
+    different clients not guaranteed to see the same values
+    but not too stale! only a few seconds
+    i.e. eventual consistency
+  *and* "read-your-own-writes"
+
+this is a common pattern:
+  updates are ACID -- and slow
+  reads are not very consistent -- but fast
+
+why is it OK that reads can yield stale data?
+  the data is news feed items, postings, likes, &c
+  users may see web pages with content that lags the DB a little
+  few people will notice or care as long as it's only a little
+  next time they look, mc will likely have caught up to the DB
+
+what does the paper mean by "consistency"?
+  they mean how out-of-date a read might be
+  "more consistent" means reads don't lag recent writes by too much
+  it's a given that reads can be stale; just trying to limit how stale
+  this is a user-experience view of consistency
+    it is not about correctness / guaranteed properties
+
+how are DB replicas kept in sync across regions?
+  one region is primary
+  all clients send updates only to primary region's DB servers
+  primary DBs distribute log of updates to DBs in secondary regions
+  secondary DBs apply
+  secondary DBs are complete replicas (not caches)
+  DB replication delay can be considerable (many seconds)
+
+Q: why do clients send updates only to primary region's DB servers?
+   why not to local region DB server?
+
+what do they do about now-stale cached data when DB is written?
+  there can be many cached copies of an item in a given region:
+    one per cluster
+  1. DBs send invalidates (delete()s) to relevant mc servers in region
+     this is McSqueal in Figure 6
+  2. writing client also invalidates mc in local cluster
+     for read-your-own-writes
+  secondary DBs hear updates, send out invalidates
+
+they ran into a number of DB-vs-mc consistency problems
+  due to concurrent updates affecting different cached copies in different orders
+  dangerous if can lead to permanently stale cached data
+
+example race (Section 2, Figure 1):
+  suppose client write(k,v) looked like (this is broken):
+    send k,v to DB
+    put(k,v) in mc -- rather than delete(k)
+  what if two clients write the same key at the same time?
+    updates might arrive at DB in one order
+    but at mc server in the other order!
+    leading to perhaps-permanent cached incorrect data
+  solution: they delete(k), not update; delete is correct in either order
+
+example race (Section 3.2.1):
+  k not in cache
+  C1 get(k), misses
+  C1 v1 = read k from DB
+    C2 writes k = v2 in DB
+    C2 delete(k)
+  C1 put(k, v1)
+  now mc has stale data, delete(k) has already happened
+  will stay stale indefinitely, until k is next written
+  solved with leases:
+    mc gives C1 a lease on k with the "miss" -- permission to write k.
+    C2's delete(k) invalidates C1's lease.
+    so mc ignores C1's put(k).
+    key still missing, so next reader will refresh it from DB
+
+Q: aren't the consistency problems caused by clients copying DB data to mc?
+   why not have only DB install values in mc, and never clients?
+     then there would be no racing client updates &c, just ordered writes
+
+A: that's correct in principle, but:
+  1. DB doesn't generally know how to compute values for mc
+     generally client app code computes cached items from DB results,
+       i.e. mc content is often not simply a literal DB record
+  2. DB doesn't know what's cached, would end up sending lots
+     of values for keys that aren't cached
+
+FB/mc lessons for storage system designers?
+  cache is vital for surviving high load, not just to reduce latency
+  need flexible tools for controlling partition vs replication
+  linearizability is too much; eventual often not enough
+
+next tuesday:
+  guest lecture from an AWS designer!
+
+--- references
+
+http://cs.cmu.edu/~beckmann/publications/papers/2020.osdi.cachelib.pdf
+https://engineering.fb.com/2008/08/20/core-data/scaling-out/
+https://www.usenix.org/system/files/conference/atc13/atc13-bronson.pdf

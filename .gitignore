@@ -1,2 +1,11 @@
 pkg/
 *-handin.tar.gz
+
+# Test outputs & build artifacts
+*.so
+mr-out*
+mr-worker*
+*.test
+
+# OS metadata
+.DS_Store

@@ -1,0 +1,306 @@
+6.5840 2026 Lecture 19: Secure Untrusted Data Repository (SUNDR) (2004)
+
+We've mostly ignored security
+  A big topic, multiple MIT courses
+  A few lectures now, intersection with consistency and replication
+
+Why this paper?
+  We routinely trust storage services: github, gmail, AFS, Dropbox.
+  Google &c may mean well, but:
+    Maybe the server s/w or h/w is buggy, even exploitable.
+    Maybe an attacker guessed server admin password, modified s/w.
+    Maybe an employee of the cloud provider is corrupt or sloppy.
+
+The problem is real!
+  Paper cites successful attacks on open source code repositories.
+  Troubling: attacker can then modify source, perhaps w/o detection.
+
+Can we obtain trustworthy storage from non-trustworthy servers?
+  [diagram: clients, server]
+
+We want "integrity"
+  Readers can check that they retrieve correct data.
+  Server can't forge or hide updates or change update order.
+    e.g. can't hide a critical security patch.
+
+SUNDR goal is integrity -- not secrecy.
+  Uses cryptography only to verify data is correct.
+
+What tools does SUNDR use for integrity?
+  cryptographic hashes
+  digital signatures
+
+Cryptographic hash, e.g. SHA-1
+  h = hash(data)
+  h is small, data can be large
+  for SHA-1, h is 160 bits
+  secure = not practical to find two different inputs that have the same hash
+  used to name data and/or to verify integrity
+
+Secure storage with cryptographic hashes
+  suppose:
+    you're using a cloud provider's key/value server
+    you want to detect if server corrupts your data
+    here's one way
+  client write(v):
+    k = hash(v)
+    put(k, v)  -- RPC to server
+    return k
+  client read(k):
+    v = get(k)  -- RPC to server
+    if hash(v) != k: reject!
+    return v
+  note k is used in two ways: as a name, and as hash for validation
+
+from where does a reading client get the key?
+  can't choose keys -- key must be hash(v)
+    so reader can't predict keys -- must be told
+  can e.g. publish on secure web pages
+  often used for e.g. secure software distributions
+
+this is secure storage with an untrusted server
+  if server corrupts data, client check will fail
+  "content-hash storage"
+
+we can build secure list- and tree-shaped structures from content-hash storage
+  [diagram: files... <- directory <- root key]
+  root key allows client to retrieve and check the whole structure
+  even if blocks are stored in untrusted server
+  paper calls this a "hash tree"
+
+content-hash storage is not enough for a read/write file system:
+  a key's value cannot change, since key = hash(v)
+  "immutable"
+ 
+Digital signatures (e.g. RSA) allow mutable storage
+  each user has a public/private key pair
+  sig = sign(data, k_priv)
+  ok = verify(data, sig, k_pub)
+  client write(k,v) OR UPDATE(k,v):
+    put(k, v+sign(v, k_priv))
+  client read(k):
+    v+sig = get(k)
+    if verify(v, sig, k_pub) != true: reject!
+    return v
+  note k and k_priv are totally separate
+  the value can be modified w/o changing k
+  anyone who knows k and k_pub can fetch the value and
+    can check that owner of k_priv signed that value
+    (though not quite "v is the correct value for k"!)
+
+Are digital signatures alone enough?
+  the server cannot forge a signature, so it cannot create arbitrary fake values
+  the server *can* return an old correctly-signed value
+    so it can hide an update
+    or show different signed versions to different readers
+    or show old versions for some keys, new for other keys
+    these are serious security problems
+  also we'd like a file system, not just individual data items
+    file names, directories, multiple users, permissions, &c
+
+Example of a stale value causing a problem:
+  Open source project, two files: x.c, NEWS
+  Storage server owned by someone else
+  X: x.c -- v1
+  A: x.c -- v2 fixes a bug
+  B: NEWS -- announce "bug fixed!"
+  C: read NEWS
+  C: read x.c
+  Server could provide new NEWS but *old* x.c!
+    Signatures would be correct! But it's the wrong x.c.
+  SUNDR can prevent this!
+
+One of SUNDR's ideas:
+  Each update includes digital signature over entire file-system (FS).
+  Thus B's update to NEWS includes a signature reflecting A's updated x.c
+  So if C sees B's updated NEWS,
+    signature will only check if C also sees A's new x.c
+
+Strawman design (Section 3.1)
+  Server stores a complete log of file-system modifications
+    create, write, rename, delete, mkdir, &c
+  Clients ask server to append new operations.
+  Clients reconstruct FS content by fetching and playing entire log.
+  Clients also ask server to append "fetch" log entries.
+
+Strawman details
+  Log entries: fetch or modify, user, sig.
+    Signature covers the entire log up to that point.
+  Client step:
+    Fetch entire log (other clients now wait).
+    Check the log:
+      Correct signature in each entry, covering prior log.
+      Each operation is allowed by permissions.
+      This client's last log entry is present (so client must remember!).
+    Construct FS state by replaying logged operations, from start.
+    Append client's operation with signature over whole resulting log.
+    Upload log (then other clients can proceed).
+    Client remembers its signed new entry (on local disk).
+  Inefficient but simple to reason about.
+
+Example straw-man log:
+  mod(x.c), X, sig   -- X creates x.c
+  mod(x.c), A, sig   -- A applies a crucial security patch
+  mod(NEWS), B, sig  -- B announces the patch
+
+Could the server forge a log entry?
+  No: it would need to know the private key of an authorized user.
+
+How do clients know the public keys of authorized users?
+  1. All clients must be told public key of root directory owner.
+  2. File system itself stores the public key of each user.
+
+Could the server hide an entry from C?
+  Yes.
+  Hiding and showing are the only bad things a SUNDR server can do.
+
+What if the server hides A's and B's updates from C?
+  C will read,
+  see just X's mod(x.c),
+  ask to append a fetch() with a signature over what it saw,
+    fetch(), C, sig
+  and remember its last operation (fetch(), C, sig).
+  [diagram: start of a forked log]
+
+Server can continue to let C extend a "forked" log
+  I'm assuming server is malicious, and has been modified to trick C
+
+Suppose later the server wants to show B's updated NEWS to C?
+  It won't work for the server to show C the "real" log:
+    mod(x.c), X, sig
+    mod(x.c), A, sig
+    mod(NEWS), B, sig
+    because C requires that its last operation (its fetch) be in the log.
+  It won't work for the server to insert NEWS before C's fetch:
+    mod(x.c), X, sig
+    mod(NEWS), B, sig
+    fetch(), C, sig
+    Because C's fetch signature didn't include A's mod(x.c).
+  Nor NEWS after C's fetch:
+    mod(x.c), X, sig
+    fetch(), C, sig
+    mod(NEWS), B, sig
+    Because B's mod()'s signature didn't include C's fetch.
+
+So the server cannot ever show C B's mod(NEWS).
+  Or any future B operation, since B will generate signatures
+  that include its mod(NEWS).
+
+The server can't show B any future C operation either.
+  Since it can't show B C's fetch(), since it's not compatible
+  with B's mod(NEWS).
+  And any future C operations will have signature covering C's fetch.
+
+But the server *can* continue to give C a separate view of the file system.
+  Containing only C's future operations.
+  But not B's operations.
+
+This is SUNDR's "fork consistency":
+  A server can permanently fork users, concealing each others' updates.
+  But the server cannot heal a fork -- forked forever.
+
+Is fork consistency a good outcome?
+  It's not ideal that SUNDR allows fork attacks.
+  But a fork will be disruptive, since hiding an update hides
+    all future updates from that user.
+    So likely to be detected after a while.
+  Users can detect if they can communicate outside of SUNDR.
+    e.g. e-mail asking "what do you think of my last update?"
+  Given assumptions, it seems the best one can do.
+
+The Question: why include fetch() in the log?
+
+Strawman is not practical: the log keeps growing!
+
+Here's a simplified overview of Section 3.3 (Serialized SUNDR).
+
+Idea: store current file-system (FS) state, not log of operations.
+  (Figure 2)
+  A hash tree mimicing an FS directory/file tree.
+    [diagram: files, directories, handle w/ signed root hash]
+    Can't be directly updated, but...
+  A signed "handle" object containing the current root hash.
+    Under a known unchanging key.
+  To update: create a new hash tree, sign root hash and update handle,
+    delete old tree.
+
+But: multiple users, each with their own public/private key.
+     users might not fully trust each other.
+     so a single writeable-by-all root is too fragile.
+
+Idea: a tree per user (and signed handle), FS is union of trees.
+  Each user's tree holds just that user's files.
+  A read fetches all trees, merge to form single FS.
+
+But: we need to enforce fork consistency.
+  i.e. detect if server is trying to heal a fork.
+  i.e. detect if clients saw different sequences of updates.
+
+User X's tree needs to declare what other trees X saw
+  when X last updated or read the file-system.
+  So clients can check that different user's trees form a linear sequence.
+  (like straw-man's signatures over the whole log)
+
+Idea:
+  Each user's tree goes through a sequence of numbered versions.
+  User X's signed handle includes (paper's Version Structure, Figure 3):
+    X's root hash.
+    X's version number.
+    A "version vector" with one number for each other user.
+      when X last read, the version it saw of each other user's tree.
+    signature (just on the handle block)
+  Then can compare numbers in X's and Y's version vectors to decide
+    do tree updates form a sequence, with each seeing previous?
+    is server trying to reveal a previously hidden tree?
+
+Example (when server is well-behaved):
+  "A1" is a new signed tree
+  "1 0 0" is the version vector in A1
+  time flows downward
+
+    A  B  C
+    -------
+A1  1  0  0
+B1  1  1  0
+C1  1  1  1
+B2  1  2  1
+
+The version vectors advance one slot (user) at a time.
+The fact that B's latest vv is "1 2 1" means B saw
+  A's version 1 and C's version 1.
+Anyone who sees B's latest update will then know to
+  demand at least those versions for A's and C's tree.
+The server can't forge vv's b/c everything is signed.
+  But it can hide the latest trees: serve old signed handles.
+
+Note in example that vv's can be ordered (if server is well-behaved):
+  Each is >= than the one before in all positions.
+  Meaning that the updates occured in order,
+    and each saw the previous updates.
+  Clients check that vv's are orderable.
+
+What if the server conceals a tree update?
+  suppose it conceals B1 from C (it can do that).
+
+    A  B  C
+    -------
+A1  1  0  0
+B1  1  1  0   C1  1 0 1
+
+The server cannot afterwards reveal C's update to B.
+  That would reveal C's vv to B.
+  B would see that B's and C's vv's cannot be ordered.
+  That is, B1 then C1 is not correct, since then B1 was hid from C.
+  And C1 then B1 is not correct, since then C1 was hid from B.
+
+And indeed SUNDR's version vector scheme enforces fork consistency.
+  And it's much cheaper than the straw-man signatures over the whole log.
+
+Take-away ideas:
+  The dream of trustworthy service from untrusted servers.
+  Fork attacks.
+  Hash trees.
+  Version vectors.
+
+Next lecture:
+  Bitcoin versus fork attacks.
