@@ -6,18 +6,43 @@ package mr
 // remember to capitalize all names.
 //
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
+// declare task types. this describes the state of workers.
+type TaskType int;
 
-type ExampleArgs struct {
-	X int
+const (
+	TaskMap = iota
+	TaskReduce
+	TaskWait // special type in map, make workers sleep when no task available.
+	TaskExit
+)
+
+
+
+// below is RPC declarations.
+
+// This struct is used for workers asking for
+// new tasks.
+type RequestTasksArgs struct {
+	
 }
 
-type ExampleReply struct {
-	Y int
+type RequestTasksReply struct {
+	TaskID int
+	TaskType TaskType 
+	FileName string
+	NReduce int
+	NMap int
+	
 }
 
-// Add your RPC definitions here.
+// This struct is used for workers reporting
+// their status to the coordinator.
+type ReportTypeArgs struct {
+	TaskType TaskType
+	TaskID int
+}
+
+type ReportTypeReply struct {
+}
+
 
