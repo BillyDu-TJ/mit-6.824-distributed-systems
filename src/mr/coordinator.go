@@ -162,7 +162,7 @@ func (c *Coordinator) AssignTask(args *RequestTasksArgs,reply *RequestTasksReply
 	return nil
 }
 
-func (c *Coordinator) ReportTask(args *ReportTypeArgs, reply *ReportTypeReply) error {
+func (c *Coordinator) ReportTask(args *ReportTasksArgs, reply *ReportTasksReply) error {
 	taskType := args.TaskType
 	taskID := args.TaskID
 

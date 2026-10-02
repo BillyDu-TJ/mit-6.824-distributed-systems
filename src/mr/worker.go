@@ -69,7 +69,7 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			nReduceBucket := make([]ByKey, reReply.NReduce)
 
 			for _, kv := range kva {
-				index := ihash(kv.Key)
+				index := ihash(kv.Key) % reReply.NReduce
 				nReduceBucket[index] = append(nReduceBucket[index], kv)
 			}
 
@@ -117,6 +117,7 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 					}
 					intermediate = append(intermediate, kv)
 				}
+				file.Close()
 			}
 
 			// Sort intermediate kv
@@ -142,6 +143,8 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 				}
 				output := reducef(intermediate[i].Key, values)	
 				fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
+
+				i = j
 			}
 
 			// rename and write disk
@@ -155,7 +158,7 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 		// call ReportTask
 		repArgs := ReportTasksArgs{reReply.TaskType, reReply.TaskID} 
 		repReply := ReportTasksReply{}
-		ok = call("coordinator.ReportTask", &repArgs, &repReply)
+		ok = call("Coordinator.ReportTask", &repArgs, &repReply)
 		if !ok {
 			log.Fatalf("Cannot report task to coordinator with task ID %v", reReply.TaskID)
 		}
