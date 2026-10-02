@@ -45,6 +45,36 @@ type Coordinator struct {
 	nMap int
 }
 
+func (c *Coordinator) checkTimeout() {
+	for {
+		time.Sleep(500 * time.Millisecond)
+
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		now := time.Now()
+
+		// iterate jobs, if one timeout, set it to Idle
+		switch c.jobState {
+		case PhaseDone:
+			return
+		case PhaseMap:
+			for _, task := range c.mapTasks {
+				if task.state == InProgress && now.Sub(task.startTime) > 10 * time.Second {
+					task.state = Idle
+				}
+			}
+			return
+		case PhaseReduce:
+			for _, task := range c.reduceTasks {
+				if task.state == InProgress && now.Sub(task.startTime) > 10 * time.Second {
+					task.state = Idle
+				}
+			}
+		}
+	}
+}
+
 // Your code here -- RPC handlers for the worker to call.
 func (c *Coordinator) AssignTask(args *RequestTasksArgs,reply *RequestTasksReply) error {
 	c.mu.Lock()
@@ -91,13 +121,65 @@ func (c *Coordinator) AssignTask(args *RequestTasksArgs,reply *RequestTasksReply
 		}
 		
 	case PhaseReduce:
+		reply.TaskType = TaskReduce
+
+		// search for available task
+		candidateTaskIndex := -1
+		for i,task := range c.reduceTasks {
+			if task.state == Idle {
+				candidateTaskIndex = i
+				c.reduceTasks[i].startTime = time.Now()
+				c.reduceTasks[i].state = InProgress
+
+				reply.TaskID = candidateTaskIndex
+				return nil
+			}
+		}
+
+		if candidateTaskIndex == -1 {
+			// check if all reduce tasks are done
+			allDone := true
+			for _,task := range c.reduceTasks {
+				if task.state != Done {
+					// All reduce jobs are InProgress, make workers wait
+					allDone = false
+					reply.TaskType = TaskWait
+					return nil
+				}
+			}
+			if allDone == true {
+				// All reduce jobs are Done, change to done
+				c.jobState = PhaseDone
+				reply.TaskType = TaskWait
+				return nil
+			}
+		}
 
 	case PhaseDone:
-		
+		reply.TaskType = TaskExit
 	}
 
 	return nil
 }
+
+func (c *Coordinator) ReportTask(args *ReportTypeArgs, reply *ReportTypeReply) error {
+	taskType := args.TaskType
+	taskID := args.TaskID
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// change task states
+	if taskType == TaskMap {
+		c.mapTasks[taskID].state = Done
+	} else if taskType == TaskReduce {
+		c.reduceTasks[taskID].state = Done
+	}
+	
+	return nil
+}
+
+
 
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server(sockname string) {
@@ -117,7 +199,12 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
+	if c.jobState == PhaseDone {
+		ret = true
+	}
 
 	return ret
 }
@@ -128,9 +215,16 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
-	// Your code here.
+	c.jobState = PhaseMap
+	c.files = files
+	c.nReduce = nReduce
+	c.nMap = len(files)
+
+	c.mapTasks = make([]Taskmeta, c.nMap)
+	c.reduceTasks = make([]Taskmeta, c.nReduce)
 
 
 	c.server(sockname)
+	go c.checkTimeout()
 	return &c
 }
