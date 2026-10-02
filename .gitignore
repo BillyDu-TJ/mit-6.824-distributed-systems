@@ -5,6 +5,8 @@ pkg/
 *.so
 mr-out*
 mr-worker*
+mr-tmp*
+mr/mr-tmp*
 *.test
 
 # OS metadata

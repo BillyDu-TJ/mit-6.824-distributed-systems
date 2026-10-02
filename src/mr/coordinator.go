@@ -50,28 +50,28 @@ func (c *Coordinator) checkTimeout() {
 		time.Sleep(500 * time.Millisecond)
 
 		c.mu.Lock()
-		defer c.mu.Unlock()
 
 		now := time.Now()
 
 		// iterate jobs, if one timeout, set it to Idle
 		switch c.jobState {
 		case PhaseDone:
+			c.mu.Unlock()
 			return
 		case PhaseMap:
-			for _, task := range c.mapTasks {
+			for i, task := range c.mapTasks {
 				if task.state == InProgress && now.Sub(task.startTime) > 10 * time.Second {
-					task.state = Idle
+					c.mapTasks[i].state = Idle
 				}
 			}
-			return
 		case PhaseReduce:
-			for _, task := range c.reduceTasks {
+			for i, task := range c.reduceTasks {
 				if task.state == InProgress && now.Sub(task.startTime) > 10 * time.Second {
-					task.state = Idle
+					c.reduceTasks[i].state = Idle
 				}
 			}
 		}
+		c.mu.Unlock()
 	}
 }
 
