@@ -37,12 +37,12 @@ type RequestTasksReply struct {
 
 // This struct is used for workers reporting
 // their status to the coordinator.
-type ReportTypeArgs struct {
+type ReportTasksArgs struct {
 	TaskType TaskType
 	TaskID int
 }
 
-type ReportTypeReply struct {
+type ReportTasksReply struct {
 }
 
 
