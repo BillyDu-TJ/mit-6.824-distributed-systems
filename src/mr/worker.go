@@ -1,17 +1,29 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -31,36 +43,122 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	coordSockName = sockname
 
 	// Your worker implementation here.
+	for {
+		// use RPC to apply task
+		reArgs := RequestTasksArgs{}
+		reReply := RequestTasksReply{}
+		ok := call("Coordinator.AssignTask", &reArgs, &reReply)
+		if !ok || (ok && reReply.TaskType == TaskExit) {
+			os.Exit(0)
+		} 
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+		switch reReply.TaskType {
+		case TaskWait:
+			time.Sleep(500 * time.Millisecond)
+			continue
+		case TaskMap:
+			// read files
+			content, err := os.ReadFile(reReply.FileName)
+			if err != nil {
+				log.Fatalf("Cannot read %v", reReply.FileName)
+				continue
+			}
+			kva := mapf(reReply.FileName, string(content))
 
-}
+			// divide into bucket
+			nReduceBucket := make([]ByKey, reReply.NReduce)
 
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
+			for _, kv := range kva {
+				index := ihash(kv.Key)
+				nReduceBucket[index] = append(nReduceBucket[index], kv)
+			}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+			// write disk
+			for i := 0; i < reReply.NReduce; i++ {
+				// write into temperary file
+				tempFile, err := os.CreateTemp(".", "mr-temp-*")
+				if err != nil {
+					log.Fatalf("Cannot create temp file")
+				}
 
-	// fill in the argument(s).
-	args.X = 99
+				enc := json.NewEncoder(tempFile)
+				for _, kv := range nReduceBucket[i] {
+					err := enc.Encode(&kv)
+					if err != nil {
+						log.Fatalf("Cannot encode json %v", err)
+					}
+				}
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+				// rename and write disk
+				tempFile.Close()
 
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+				finalName := fmt.Sprintf("mr-%d-%d", reReply.TaskID, i)
+				err = os.Rename(tempFile.Name(), finalName)
+				if err != nil {
+					log.Fatalf("Cannot rename file %v", err);
+				}
+			}
+
+		case TaskReduce:
+			intermediate := []KeyValue{}
+			// read files and get intermediate kv
+			for i := 0; i < reReply.NMap; i++ {
+				reduceName := fmt.Sprintf("mr-%d-%d", i, reReply.TaskID)
+				file, err := os.Open(reduceName)
+				if err != nil {
+					log.Fatalf("Cannot read %v", reduceName)
+					continue
+				}
+				dec := json.NewDecoder(file)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					intermediate = append(intermediate, kv)
+				}
+			}
+
+			// Sort intermediate kv
+			sort.Sort(ByKey(intermediate))
+
+			//
+			// call Reduce on each distinct key in intermediate[],
+			// and print the result to mr-out-0.
+			//
+			tempFile, err := os.CreateTemp(".", "mr-temp-out-*")
+				if err != nil {
+					log.Fatalf("Cannot create temp file")
+				}
+			i := 0
+			for i < len(intermediate) {
+				j := i + 1
+				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, intermediate[k].Value)
+				}
+				output := reducef(intermediate[i].Key, values)	
+				fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
+			}
+
+			// rename and write disk
+			tempFile.Close()
+			finalName := fmt.Sprintf("mr-out-%d", reReply.TaskID)
+			err = os.Rename(tempFile.Name(), finalName)
+			if err != nil {
+				log.Fatalf("Cannot rename file %v", err);
+			}
+		}
+		// call ReportTask
+		repArgs := ReportTasksArgs{reReply.TaskType, reReply.TaskID} 
+		repReply := ReportTasksReply{}
+		ok = call("coordinator.ReportTask", &repArgs, &repReply)
+		if !ok {
+			log.Fatalf("Cannot report task to coordinator with task ID %v", reReply.TaskID)
+		}
 	}
 }
 
