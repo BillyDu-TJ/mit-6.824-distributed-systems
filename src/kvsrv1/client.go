@@ -1,20 +1,24 @@
 package kvsrv
 
 import (
+	"log"
+
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
 )
 
 
 type Clerk struct {
 	clnt   *tester.Clnt
 	server string
+	currentversion rpc.Tversion
 }
 
 func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 	ck := &Clerk{clnt: clnt, server: server}
 	// You may add code here.
+	ck.currentversion = 0
 	return ck
 }
 
@@ -30,7 +34,16 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
-	return "", 0, rpc.ErrNoKey
+	getargs := rpc.GetArgs{Key:key}
+	getreply := rpc.GetReply{}
+
+	// create a rpc call
+	ok := ck.clnt.Call(ck.server, "KVServer.Get", &getargs, &getreply);
+	if !ok {
+		log.Fatalf("cannot call server")
+	}
+
+	return getreply.Value, getreply.Version, getreply.Err
 }
 
 // Put updates key with value only if the version in the
@@ -52,5 +65,13 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	return rpc.ErrNoKey
+	putargs := rpc.PutArgs{Key:key, Value:value, Version:version}
+	putreply := rpc.PutReply{}
+
+	// create a rpc call
+	ok := ck.clnt.Call(ck.server, "KVServer.Put", &putargs, &putreply);
+	if !ok {
+		log.Fatalf("cannot call server")
+	}
+	return putreply.Err
 }
