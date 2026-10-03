@@ -1,7 +1,7 @@
 package kvsrv
 
 import (
-	"log"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
@@ -38,9 +38,15 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	getreply := rpc.GetReply{}
 
 	// create a rpc call
-	ok := ck.clnt.Call(ck.server, "KVServer.Get", &getargs, &getreply);
-	if !ok {
-		log.Fatalf("cannot call server")
+	for {
+		ok := ck.clnt.Call(ck.server, "KVServer.Get", &getargs, &getreply);
+		if !ok {
+			// RPC dropped or timeout
+			time.Sleep(100 * time.Millisecond)
+			continue
+		} else {
+			break
+		}
 	}
 
 	return getreply.Value, getreply.Version, getreply.Err
@@ -69,9 +75,25 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	putreply := rpc.PutReply{}
 
 	// create a rpc call
-	ok := ck.clnt.Call(ck.server, "KVServer.Put", &putargs, &putreply);
-	if !ok {
-		log.Fatalf("cannot call server")
+	resend := false
+	for {
+		ok := ck.clnt.Call(ck.server, "KVServer.Put", &putargs, &putreply);
+		if !ok {
+			// RPC dropped or timeout
+			resend = true
+			time.Sleep(100 * time.Millisecond)
+			continue
+		} else {
+			switch putreply.Err {
+			case rpc.ErrVersion:
+				if !resend {
+					return putreply.Err
+				} else {
+					return rpc.ErrMaybe
+				}
+			default:
+				return putreply.Err
+			}
+		}
 	}
-	return putreply.Err
 }
