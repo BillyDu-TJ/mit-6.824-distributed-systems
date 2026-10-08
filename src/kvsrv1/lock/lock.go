@@ -35,6 +35,19 @@ func (lk *Lock) Acquire() {
 		// polling to get lock
 		id, version, err := lk.ck.Get(lk.myName)
 		// log.Printf("[%s] Get returned id='%s', ver=%d, err=%v", lk.myID, id, version, err)
+		if id == lk.myID {
+			// suffered a network error, and resend.
+			// thus, we get ErrMaybe, and if we right
+			// succeded, but reply lost in the network,
+			// out get will return ours' name.
+			// this means we have write successfully, 
+			// directly return
+			return
+		}
+		if err == rpc.ErrMaybe {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
 		if err == rpc.ErrNoKey {
 			// create a key
 			ok := lk.ck.Put(lk.myName, lk.myID, 0)
@@ -67,7 +80,21 @@ func (lk *Lock) Acquire() {
 }
 
 func (lk *Lock) Release() {
-	// get the version first
-	_, currentVersion, _ := lk.ck.Get(lk.myName)
-	lk.ck.Put(lk.myName, "", currentVersion)
+	for {
+		// get the version first
+		id, currentVersion, err := lk.ck.Get(lk.myName)
+		if err == rpc.ErrNoKey || id != lk.myID {
+			// the lock was released, return
+			return
+		}
+		if id == lk.myID {
+			ok := lk.ck.Put(lk.myName, "", currentVersion)
+			if ok == rpc.OK {
+				return
+			} else {
+				// network error. retry
+				continue
+			}
+		}	
+	}
 }
