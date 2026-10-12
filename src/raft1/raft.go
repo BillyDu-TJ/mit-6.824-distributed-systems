@@ -8,14 +8,14 @@ package raft
 // raft interface.
 
 import (
-	//	"bytes"
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sort"
 	"sync"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -64,7 +64,13 @@ type Raft struct {
 	lastApplied		int                 // the last log entry index applied by me
 	nextIndex		[]int				// the next index leader is going to post, initialized to lastLogIndex + 1
 	matchIndex		[]int 				// the highest entry known to be replicated.
+	
+	// state for snapshot(3D)
+	lastIncludedIndex int 				// the last logical index covered by current snapshot
+	snapshot		  []byte			// the current snapshot
+	pendingSnapshot   bool				// true if new snapshot for applyCh
 
+	// chanel communicating with upper application
 	applyCh 		chan raftapi.ApplyMsg // channel to communicate with application
 	applyCond		*sync.Cond			  // contition variable for update local state machine
 }
@@ -88,6 +94,8 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.role = Follower
 	rf.currentTerm = term
 	rf.votedFor = -1
+	rf.persist()
+
 	rf.assert(rf.role == Follower && rf.votedFor == -1, "State must be Follower with votedFor reset")
 }
 
@@ -98,6 +106,8 @@ func (rf *Raft) becomeCandidate() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.resetElectionTimer()
+	rf.persist()
+
 	rf.assert(rf.role == Candidate && rf.votedFor == rf.me, "Candidate must vote for self")
 }
 
@@ -153,35 +163,39 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) == 0 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var currentTerm int
+	var votedFor 	int
+	var log			[]Log
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		rf.assert(false, "Decode persistent infomation error")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
+
+	rf.assert(rf.currentTerm >= 0, "persisted currentTerm must be non-negative")
+	rf.assert(rf.votedFor >= -1 && rf.votedFor < len(rf.peers), "persisted votedFor out of bounds")
+	rf.assert(len(rf.log) >= 1 && rf.log[0].TermID == -1, "persisted log must contain intact dummy entry at index 0")
 }
 
 // how many bytes in Raft's persisted log?
@@ -289,6 +303,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateID
 			reply.VoteGranted = true
 			rf.resetElectionTimer()
+			rf.persist()
 		}
 	}
 
@@ -328,13 +343,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			// case 2: term id not match
 			reply.ConflictTerm = rf.log[args.PrevLogIndex].TermID
-			for i := args.PrevLogIndex; i > 0; i-- {
-				if rf.log[i].TermID == reply.ConflictTerm - 1 {
-					reply.ConflictIndex = i + 1
+			for i := 1; i <= args.PrevLogIndex; i++ {
+				if rf.log[i].TermID == reply.ConflictTerm {
+					reply.ConflictIndex = i
+					rf.assert(reply.ConflictIndex >= 1 && reply.ConflictIndex <= args.PrevLogIndex, "ConflictIndex must exist")
 					break
 				}
 			}
 		}
+		rf.resetElectionTimer()
 		return
 	}
 
@@ -343,10 +360,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		targetIndex := args.PrevLogIndex + 1 + i
 		if targetIndex >= len(rf.log) {
 			rf.log = append(rf.log, args.Entries[i:]...)
+			rf.persist()
 			break
 		}
 		if rf.log[targetIndex].TermID != args.Entries[i].TermID {
 			rf.log = append(rf.log[:targetIndex], args.Entries[i:]...)
+			rf.persist()
 			break
 		}
 	}
@@ -519,8 +538,13 @@ func (rf *Raft) broadcastAppendEntries() {
 			}
 
 			if reply.Success {
-				rf.matchIndex[target] = AEargs.PrevLogIndex + len(AEargs.Entries)
-				rf.nextIndex[target] = rf.matchIndex[target] + 1
+				if AEargs.PrevLogIndex + len(AEargs.Entries) >= rf.matchIndex[target] {
+					rf.matchIndex[target] = AEargs.PrevLogIndex + len(AEargs.Entries)
+					rf.nextIndex[target] = rf.matchIndex[target] + 1
+				}
+
+				// rf.assert(rf.matchIndex[target] >= prevMatchIndex, "matchIndex must be monotonically non-decreasing within a term")
+				// rf.assert(rf.nextIndex[target] == rf.matchIndex[target]+1, "nextIndex must equal matchIndex + 1 after successful replication")
 				rf.tryAdvanceCommitIndex()
 			} else {
 				// if follower reject, there are two cases.
@@ -535,7 +559,7 @@ func (rf *Raft) broadcastAppendEntries() {
 				// Howerver, AppendEntries has idempotent property! it will ignore
 				// the entry that already exists. so we can simplified into 1!
 				if reply.ConflictIndex < rf.nextIndex[target] {
-					rf.nextIndex[target] = max(1, reply.ConflictIndex)
+					rf.nextIndex[target] = max(rf.matchIndex[target] + 1, reply.ConflictIndex)
 				}
 			}
 		}(peerIndex, args)
@@ -572,6 +596,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.currentTerm
 	rf.matchIndex[rf.me] = index
 	rf.nextIndex[rf.me] = index + 1
+
+	rf.persist()
 
 	go rf.broadcastAppendEntries()
 
