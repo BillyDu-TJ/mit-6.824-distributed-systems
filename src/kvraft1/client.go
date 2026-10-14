@@ -1,9 +1,11 @@
 package kvraft
 
 import (
+	"time"
+
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
 )
 
 
@@ -35,9 +37,21 @@ func (ck *Clerk) Leader() int {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
-
-	// You will have to modify this function.
-	return "", 0, ""
+	leader := ck.Leader()
+	args := rpc.GetArgs{Key:key}
+	reply := rpc.GetReply{}
+	for {
+		ok := ck.clnt.Call(ck.servers[leader], "KVServer.Get", &args, &reply)
+		if !ok || reply.Err == rpc.ErrWrongLeader {
+			leader = (leader + 1) % len(ck.servers)
+			ck.leader = leader
+			time.Sleep(100 * time.Millisecond)
+			continue
+		} else {
+			break
+		}
+	}
+	return reply.Value, reply.Version, reply.Err
 }
 
 // Put updates key with value only if the version in the
@@ -58,6 +72,30 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
-	// You will have to modify this function.
-	return ""
+	args := rpc.PutArgs{Key:key, Value:value, Version:version} 
+	reply := rpc.PutReply{}
+
+	resend := false 
+	leader := ck.Leader()
+	for {
+		ok := ck.clnt.Call(ck.servers[leader], "KVServer.Put", &args, &reply)
+		if !ok || reply.Err == rpc.ErrWrongLeader {
+			leader = (leader + 1) % len(ck.servers)
+			ck.leader = leader
+			resend = true
+			time.Sleep(100 * time.Millisecond)
+			continue
+		} else {
+			switch reply.Err {
+			case rpc.ErrVersion:
+				if !resend {
+					return reply.Err
+				} else {
+					return rpc.ErrMaybe
+				}
+			default:
+				return reply.Err
+			}
+		}
+	}
 }
