@@ -1,22 +1,27 @@
 package rsm
 
 import (
+	"math/rand"
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
-	"6.5840/raft1"
+	raft "6.5840/raft1"
 	"6.5840/raftapi"
-	"6.5840/tester1"
-
+	tester "6.5840/tester1"
 )
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	ID 	int64
+	Req any
 }
 
+type OpResult struct {
+	Err 	rpc.Err
+	Value 	any
+	ID 		int64
+}
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -38,6 +43,7 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
+	pending		 map[int]chan OpResult
 }
 
 // servers[] contains the ports of the set of
@@ -61,10 +67,12 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
+		pending:	  make(map[int]chan OpResult),
 	}
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	go rsm.reader()
 	return rsm
 }
 
@@ -81,7 +89,56 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// Submit creates an Op structure to run a command through Raft;
 	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
 	// is the argument to Submit and id is a unique id for the op.
+	id := int64(rand.Int() + rsm.me)
 
-	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	op := Op{ID:id, Req: req}
+
+	index, _, isLeader := rsm.rf.Start(op)
+
+	if !isLeader {
+		return rpc.ErrWrongLeader, nil
+	}
+
+	rsm.mu.Lock()
+	ch := make(chan OpResult, 1)
+	rsm.pending[index] = ch
+	rsm.mu.Unlock()
+	defer func() {
+		rsm.mu.Lock()
+		delete(rsm.pending, index)
+		rsm.mu.Unlock()
+	}()
+
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+
+	select {
+	case res := <-ch:
+		if res.ID == op.ID {
+			return rpc.OK, res.Value
+		} else {
+			return rpc.ErrWrongLeader, nil
+		}
+	case <-timer.C:
+		return rpc.ErrWrongLeader, nil
+	}
+}
+
+func (rsm *RSM) reader() {
+	for msg := range rsm.applyCh {
+		if msg.CommandValid == true {
+			op := msg.Command.(Op)
+			res := rsm.sm.DoOp(op.Req)
+
+			rsm.mu.Lock()
+			ch, ok := rsm.pending[msg.CommandIndex]
+			if ok {
+				result := OpResult{Err: rpc.OK, Value: res, ID:op.ID}
+				ch <- result
+			}
+			rsm.mu.Unlock()
+		} else if msg.SnapshotValid == true {
+
+		}
+	}
 }
